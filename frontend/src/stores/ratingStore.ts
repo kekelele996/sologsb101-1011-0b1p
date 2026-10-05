@@ -192,14 +192,14 @@ export const useRatingStore = defineStore('rating', () => {
    */
   async function rebuildCompares(lineNo?: string): Promise<number> {
     const targetLine = lineNo ?? activeLineNo.value
+    // 直读 IndexedDB：岸边系数刚触发关系点据回写时，liveQuery 缓存可能尚未刷新
+    const freshRatings = await db.ratings.where('lineNo').equals(targetLine).toArray()
     const fit = fitPowerCurve(
-      ratings.value
-        .filter((rating) => rating.lineNo === targetLine)
-        .map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s })),
+      freshRatings.map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s })),
       targetLine
     )
     setFit(fit)
-    const targets = ratings.value.filter((rating) => rating.lineNo === targetLine)
+    const targets = freshRatings
     if (targets.length === 0) return 0
     const now = Date.now()
     const rows: Compare[] = targets.map((rating) => {

@@ -15,7 +15,7 @@ import { useStationStore } from '@/stores/stationStore'
 import { useSectionStore } from '@/stores/sectionStore'
 import { parsePointPaste } from '@/types/point'
 import type { Point } from '@/types/point'
-import { calcMeanVelocity, calcSectionDischarge, velocityFromRevolutions } from '@/utils/flow'
+import { calcMeanVelocity, velocityFromRevolutions } from '@/utils/flow'
 import { initDatabase } from '@/utils/db'
 
 const route = useRoute()
@@ -49,21 +49,8 @@ const meanVelocityMs = computed(() =>
   calcMeanVelocity(points.value.map((point) => ({ velocityMs: point.velocityMs, weight: point.weight })))
 )
 
-/** 该垂线所在断面的流量成果（用于对比本垂线贡献） */
-const discharge = computed(() => {
-  if (!section.value) return null
-  const rows = sectionStore.verticalsOfSection(section.value.id).map((item) => {
-    const itemPoints = sectionStore.pointsOfVertical(item.id)
-    return {
-      id: item.id,
-      no: item.no,
-      startDistanceM: item.startDistanceM,
-      depthM: item.depthM,
-      meanVelocityMs: calcMeanVelocity(itemPoints.map((point) => ({ velocityMs: point.velocityMs, weight: point.weight })))
-    }
-  })
-  return calcSectionDischarge(rows)
-})
+/** 该垂线所在断面的流量成果（含岸边系数折算，与垂线页同一入口） */
+const discharge = computed(() => (section.value ? sectionStore.sectionDischarge(section.value) : null))
 
 /** 本垂线的部分流量 */
 const verticalPartialFlow = computed(() => {

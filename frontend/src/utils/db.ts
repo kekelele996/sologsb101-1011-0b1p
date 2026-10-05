@@ -14,10 +14,11 @@ import type { Rating } from '@/types/rating'
 import type { Compare } from '@/types/compare'
 import { calcDeviationPct, judgeDeviation } from '@/types/compare'
 import { fitPowerCurve } from '@/types/rating'
+import { defaultBankCoef } from '@/types/section'
 import { calcMeanVelocity, DEFAULT_WEIGHTS, round } from '@/utils/flow'
 
 /** 当前数据结构版本号：每次调整字段结构必须 +1 并补迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** 数据库名（浏览器 IndexedDB 中的库名） */
 export const DB_NAME = 'gbhydrogaug'
@@ -95,6 +96,38 @@ class HydroGaugeDatabase extends Dexie {
             })
         }
       })
+
+    // v3：断面测次增加左右岸岸边流速系数。老测次没这两个数，按测法补默认来源
+    // （流速仪 0.7、浮标 0.75、ADCP 0.6），手填值留空；认不出测法的先不折算并标记 none。
+    this.version(DB_VERSION)
+      .stores({
+        stations: 'id, name, river, sectionCode, catchmentKm2, updatedAt',
+        sections: 'id, stationId, measureNo, method, stageM, measuredAt, updatedAt',
+        verticals: 'id, sectionId, no, startDistanceM, depthM, updatedAt',
+        points: 'id, verticalId, relativeDepth, velocityMs, updatedAt',
+        ratings: 'id, stationId, lineNo, stageM, flowM3s, measuredAt, updatedAt',
+        compares: 'id, ratingId, verdict, deviationPct, comparedAt, updatedAt'
+      })
+      .upgrade(async (tx) => {
+        await tx
+          .table('sections')
+          .toCollection()
+          .modify((row: Record<string, unknown>) => {
+            const source = defaultBankCoef(typeof row.method === 'string' ? row.method : undefined) !== null ? 'default' : 'none'
+            if (!Number.isFinite(row.leftBankCoef as number)) {
+              row.leftBankCoef = null
+              row.leftBankCoefSource = source
+            } else if (typeof row.leftBankCoefSource !== 'string') {
+              row.leftBankCoefSource = 'manual'
+            }
+            if (!Number.isFinite(row.rightBankCoef as number)) {
+              row.rightBankCoef = null
+              row.rightBankCoefSource = source
+            } else if (typeof row.rightBankCoefSource !== 'string') {
+              row.rightBankCoefSource = 'manual'
+            }
+          })
+      })
   }
 }
 
@@ -155,6 +188,10 @@ export async function seedDemoData(): Promise<void> {
           startDistanceM: 12.5,
           stageM: 5.42,
           method: '流速仪',
+          leftBankCoef: null,
+          rightBankCoef: 0.67,
+          leftBankCoefSource: 'default',
+          rightBankCoefSource: 'manual',
           measuredAt: '2024-06-12T08:30:00.000Z'
         },
         {
@@ -164,6 +201,10 @@ export async function seedDemoData(): Promise<void> {
           startDistanceM: 12.5,
           stageM: 6.15,
           method: 'ADCP',
+          leftBankCoef: null,
+          rightBankCoef: null,
+          leftBankCoefSource: 'default',
+          rightBankCoefSource: 'default',
           measuredAt: '2024-07-18T09:10:00.000Z'
         }
       ],
@@ -203,6 +244,10 @@ export async function seedDemoData(): Promise<void> {
           startDistanceM: 4.2,
           stageM: 3.18,
           method: '浮标',
+          leftBankCoef: null,
+          rightBankCoef: null,
+          leftBankCoefSource: 'default',
+          rightBankCoefSource: 'default',
           measuredAt: '2024-05-22T07:50:00.000Z'
         },
         {
@@ -212,6 +257,10 @@ export async function seedDemoData(): Promise<void> {
           startDistanceM: 4.2,
           stageM: 4.36,
           method: '流速仪',
+          leftBankCoef: null,
+          rightBankCoef: null,
+          leftBankCoefSource: 'default',
+          rightBankCoefSource: 'default',
           measuredAt: '2024-08-09T06:40:00.000Z'
         }
       ],
@@ -251,6 +300,10 @@ export async function seedDemoData(): Promise<void> {
           startDistanceM: 18.0,
           stageM: 5.36,
           method: 'ADCP',
+          leftBankCoef: null,
+          rightBankCoef: null,
+          leftBankCoefSource: 'default',
+          rightBankCoefSource: 'default',
           measuredAt: '2024-06-20T10:05:00.000Z'
         }
       ],

@@ -4,7 +4,7 @@
  * 起点距排序校验（重复起点距高亮告警）、按相对水深自动生成测点行、
  * 部分面积法汇总断面流量；深链访问时断面不存在给出友好空态。
  */
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Delete, Edit, Plus, Refresh, Right, Warning } from '@element-plus/icons-vue'
@@ -13,18 +13,31 @@ import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import RouteMissingPanel from '@/components/common/RouteMissingPanel.vue'
 import { useStationStore } from '@/stores/stationStore'
 import { useSectionStore } from '@/stores/sectionStore'
+import { useRatingStore } from '@/stores/ratingStore'
 import { buildRelativeDepths, type Vertical } from '@/types/vertical'
-import { calcMeanVelocity, calcSectionDischarge } from '@/utils/flow'
+import {
+  BANK_COEF_SOURCE_TEXT,
+  defaultBankCoef,
+  resolveSectionBankCoefs
+} from '@/types/section'
+import { calcMeanVelocity } from '@/utils/flow'
 import { initDatabase } from '@/utils/db'
+
+const BANK_SOURCE_TEXT = BANK_COEF_SOURCE_TEXT
 
 const route = useRoute()
 const router = useRouter()
 const stationStore = useStationStore()
 const sectionStore = useSectionStore()
+const ratingStore = useRatingStore()
 
 const sectionId = computed(() => String(route.params.id ?? ''))
 const section = computed(() => sectionStore.sectionById(sectionId.value))
 const station = computed(() => (section.value ? stationStore.stationById(section.value.stationId) : null))
+
+/** 左右岸岸边流速系数表单：null 表示未填（按测法取默认） */
+const coefForm = reactive<{ left: number | null; right: number | null }>({ left: null, right: null })
+const savingCoef = ref(false)
 
 const dialogVisible = ref(false)
 const editingId = ref<string | null>(null)
@@ -49,18 +62,84 @@ const verticalRows = computed(() =>
   })
 )
 
-/** 断面流量成果：部分面积法 */
-const discharge = computed(() =>
-  calcSectionDischarge(
-    verticalRows.value.map((row) => ({
-      id: row.vertical.id,
-      no: row.vertical.no,
-      startDistanceM: row.vertical.startDistanceM,
-      depthM: row.vertical.depthM,
-      meanVelocityMs: row.meanVelocityMs
-    }))
-  )
-)
+/** 断面流量成果：部分面积法 + 岸边流速系数折算（store 统一入口） */
+const discharge = computed(() => sectionStore.sectionDischarge(section.value))
+
+/** 左右岸系数解析结果（手填 / 默认 / 不折算） */
+const bankCoefs = computed(() => (section.value ? resolveSectionBankCoefs(section.value) : null))
+
+/** 测法默认值（输入框占位与说明用） */
+const methodDefault = computed(() => (section.value ? defaultBankCoef(section.value.method) : null))
+
+/** 把测次上手填值同步进表单（测次切换或升级补默认后） */
+function syncCoefForm(): void {
+  coefForm.left = section.value?.leftBankCoef ?? null
+  coefForm.right = section.value?.rightBankCoef ?? null
+}
+
+function coefSourceText(side: 'left' | 'right'): string {
+  const resolved = bankCoefs.value?.[side]
+  return resolved ? BANK_COEF_SOURCE_TEXT[resolved.source] : ''
+}
+
+function validateCoef(value: number | null, label: string): boolean {
+  if (value === null) return true
+  if (!Number.isFinite(value) || value <= 0 || value > 1) {
+    ElMessage.warning(`${label}岸边流速系数应为 0~1 之间的数字（留空则按测法取默认）`)
+    return false
+  }
+  return true
+}
+
+async function saveBankCoefs(): Promise<void> {
+  if (!section.value) return
+  if (!validateCoef(coefForm.left, '左') || !validateCoef(coefForm.right, '右')) return
+  savingCoef.value = true
+  try {
+    const { section: freshSection, ratingCount } = await sectionStore.applyBankCoefs(section.value.id, {
+      left: coefForm.left,
+      right: coefForm.right
+    })
+    // 系数一动，重算受影响关系点据所属定线的比测记录（曲线流量、偏差、判定一起刷新）
+    const measureNo = section.value.measureNo
+    const stationId = section.value.stationId
+    const affectedLines = new Set(
+      ratingStore.ratings
+        .filter((rating) => rating.stationId === stationId && rating.measureNo === measureNo)
+        .map((rating) => rating.lineNo)
+    )
+    for (const lineNo of affectedLines) {
+      await ratingStore.rebuildCompares(lineNo)
+    }
+    const applied = freshSection ? resolveSectionBankCoefs(freshSection) : bankCoefs.value
+    const sideText = (label: string, value: number, source: 'manual' | 'default' | 'none') =>
+      `${label} ${value.toFixed(2)}（${BANK_COEF_SOURCE_TEXT[source]}）`
+    ElMessage.success(
+      `岸边系数已保存：${sideText('左岸', applied?.left.value ?? 1, applied?.left.source ?? 'none')}、` +
+        `${sideText('右岸', applied?.right.value ?? 1, applied?.right.source ?? 'none')}；断面流量已重算` +
+        `${ratingCount > 0 ? `，并联动刷新 ${ratingCount} 条关系点据` : ''}` +
+        `${affectedLines.size > 0 ? `、${affectedLines.size} 条定线的比测记录` : ''}`
+    )
+  } finally {
+    savingCoef.value = false
+  }
+}
+
+/** 清空某一岸手填值，恢复按测法取默认 */
+function clearBankCoef(side: 'left' | 'right'): void {
+  coefForm[side] = null
+}
+
+/** 岸边垂线行高亮（系数 < 1 时挂暖色） */
+function sliceRowClass({ row }: { row: { bankSide: 'left' | 'right' | null; bankCoef: number } }): string {
+  if (row.bankSide && row.bankCoef < 1) return 'gb-row-bank'
+  return ''
+}
+
+/** 表格行系数来源文案（row 在模板里为隐式 any，统一在这里收窄） */
+function sliceCoefText(source: 'manual' | 'default' | 'none' | null): string {
+  return source ? BANK_SOURCE_TEXT[source] : ''
+}
 
 const stats = computed(() => ({
   verticalCount: verticals.value.length,
@@ -172,8 +251,16 @@ function gotoPoints(vertical: Vertical): void {
 
 onMounted(() => {
   if (stationStore.stations.length === 0) void initDatabase()
+  ratingStore.start()
   sectionStore.selectSection(sectionId.value)
+  syncCoefForm()
 })
+
+// 深链切换测次或系数由级联写回后，表单跟随当前测次
+watch(
+  () => section.value?.id,
+  () => syncCoefForm()
+)
 </script>
 
 <template>
@@ -234,6 +321,63 @@ onMounted(() => {
         :title="`起点距排序校验未通过：垂线 ${conflicts.join('、')} 的起点距与其他垂线重复，请调整后再参与流量计算`"
       />
 
+      <el-alert
+        v-if="bankCoefs && !bankCoefs.methodKnown"
+        type="warning"
+        show-icon
+        :closable="false"
+        title="本测次测法认不出岸边流速系数默认值，左右岸暂不折算（系数按 1.00 计）。请在测次中选用流速仪 / 浮标 / ADCP，或在下方手填系数。"
+      />
+
+      <el-card v-if="verticalRows.length > 0" shadow="never" class="gb-panel">
+        <div class="gb-panel-title">
+          <h3>岸边流速系数</h3>
+          <span class="gb-hint">
+            只压在最左、最右两条垂线各自分担的面积上；中间垂线照原样。留空按测法取默认
+            <template v-if="methodDefault !== null">（{{ section?.method }} 默认 {{ methodDefault?.toFixed(2) }}）</template>
+          </span>
+        </div>
+        <div class="page__coef-row">
+          <div class="page__coef-item">
+            <span class="page__coef-label">左岸系数</span>
+            <el-input-number
+              v-model="coefForm.left"
+              :min="0.01"
+              :max="1"
+              :step="0.01"
+              :precision="2"
+              controls-position="right"
+              :placeholder="methodDefault !== null ? methodDefault.toFixed(2) : '不折算'"
+            />
+            <el-tag size="small" :type="coefSourceText('left') === '手填' ? 'warning' : coefSourceText('left') === '不折算' ? 'info' : 'success'" effect="plain">
+              {{ coefSourceText('left') }}{{ bankCoefs?.left.defaultValue ? ` ${bankCoefs.left.defaultValue.toFixed(2)}` : '' }}
+            </el-tag>
+            <el-button v-if="coefForm.left !== null" link type="info" size="small" @click="clearBankCoef('left')">恢复默认</el-button>
+          </div>
+          <div class="page__coef-item">
+            <span class="page__coef-label">右岸系数</span>
+            <el-input-number
+              v-model="coefForm.right"
+              :min="0.01"
+              :max="1"
+              :step="0.01"
+              :precision="2"
+              controls-position="right"
+              :placeholder="methodDefault !== null ? methodDefault.toFixed(2) : '不折算'"
+            />
+            <el-tag size="small" :type="coefSourceText('right') === '手填' ? 'warning' : coefSourceText('right') === '不折算' ? 'info' : 'success'" effect="plain">
+              {{ coefSourceText('right') }}{{ bankCoefs?.right.defaultValue ? ` ${bankCoefs.right.defaultValue.toFixed(2)}` : '' }}
+            </el-tag>
+            <el-button v-if="coefForm.right !== null" link type="info" size="small" @click="clearBankCoef('right')">恢复默认</el-button>
+          </div>
+          <el-button type="primary" :loading="savingCoef" @click="saveBankCoefs">保存并重算断面流量</el-button>
+        </div>
+        <p class="gb-hint">
+          当前采用：左岸系数 {{ discharge.leftBankCoef.toFixed(2) }}（{{ BANK_SOURCE_TEXT[discharge.leftBankCoefSource] }}）、
+          右岸系数 {{ discharge.rightBankCoef.toFixed(2) }}（{{ BANK_SOURCE_TEXT[discharge.rightBankCoefSource] }}）
+        </p>
+      </el-card>
+
       <EmptyPanel
         v-if="verticalRows.length === 0"
         title="该测次还没有垂线"
@@ -290,18 +434,50 @@ onMounted(() => {
       <div v-if="verticalRows.length > 0" class="gb-panel">
         <div class="gb-panel-title">
           <h3>部分面积法断面流量成果</h3>
-          <span class="gb-hint">水面宽 {{ discharge.widthM }} m · 断面面积 {{ discharge.areaM2 }} m² · 平均流速 {{ discharge.meanVelocityMs }} m/s</span>
+          <span class="gb-hint">
+            水面宽 {{ discharge.widthM }} m · 断面面积 {{ discharge.areaM2 }} m² · 平均流速 {{ discharge.meanVelocityMs }} m/s
+            <template v-if="discharge.bankAdjusted">
+              · 折减前 {{ discharge.rawFlowM3s.toFixed(3) }} m³/s，岸边折算 {{ discharge.bankReducedFlowM3s.toFixed(3) }} m³/s
+            </template>
+            <template v-else-if="discharge.bankSkipped">· 测法未识别，本测次未做岸边折算</template>
+          </span>
         </div>
-        <el-table :data="discharge.slices" border size="small" class="gb-table-compact">
-          <el-table-column prop="no" label="垂线号" width="90" align="center" />
-          <el-table-column label="部分面积 (m²)" align="right">
+        <el-table :data="discharge.slices" border size="small" class="gb-table-compact" :row-class-name="sliceRowClass">
+          <el-table-column label="垂线号" width="86" align="center">
+            <template #default="{ row }">
+              <span class="gb-mono">{{ row.no }}</span>
+              <el-tag v-if="row.bankSide" size="small" :type="row.bankCoef < 1 ? 'warning' : 'info'" effect="plain" class="page__bank-tag">
+                {{ row.bankSide === 'left' ? '左岸' : '右岸' }}
+              </el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="部分面积 (m²)" width="130" align="right">
             <template #default="{ row }">
               <span class="gb-mono">{{ row.partialAreaM2.toFixed(3) }}</span>
             </template>
           </el-table-column>
-          <el-table-column label="部分流量 (m³/s)" align="right">
+          <el-table-column label="岸边系数" width="150" align="center">
             <template #default="{ row }">
-              <span class="gb-mono">{{ row.partialFlow.toFixed(3) }}</span>
+              <el-tooltip
+                v-if="row.bankCoefSource"
+                :content="`${row.bankSide === 'left' ? '左' : '右'}岸系数 ${row.bankCoef.toFixed(2)}（${sliceCoefText(row.bankCoefSource)}）`"
+                placement="top"
+              >
+                <el-tag size="small" :type="row.bankCoefSource === 'manual' ? 'warning' : row.bankCoefSource === 'none' ? 'info' : 'success'" effect="plain">
+                  {{ row.bankCoef.toFixed(2) }} · {{ sliceCoefText(row.bankCoefSource) }}
+                </el-tag>
+              </el-tooltip>
+              <span v-else class="gb-hint">—</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="折减前部分流量 (m³/s)" width="180" align="right">
+            <template #default="{ row }">
+              <span class="gb-mono">{{ row.rawPartialFlow.toFixed(3) }}</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="折减后部分流量 (m³/s)" width="180" align="right">
+            <template #default="{ row }">
+              <span class="gb-mono" :class="{ 'page__bank-flow': row.bankCoef < 1 }">{{ row.partialFlow.toFixed(3) }}</span>
             </template>
           </el-table-column>
           <el-table-column label="占断面流量" align="right">
@@ -385,5 +561,38 @@ onMounted(() => {
   margin-left: 4px;
   color: #d68910;
   vertical-align: middle;
+}
+
+.page__coef-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 18px;
+  margin: 10px 0 6px;
+}
+
+.page__coef-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.page__coef-label {
+  font-size: 13px;
+  color: #34506b;
+  font-weight: 600;
+}
+
+.page__bank-tag {
+  margin-left: 4px;
+}
+
+.page__bank-flow {
+  color: #b9770e;
+  font-weight: 700;
+}
+
+:deep(.gb-row-bank) {
+  background-color: #fdf6e3;
 }
 </style>

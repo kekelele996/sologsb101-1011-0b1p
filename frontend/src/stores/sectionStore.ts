@@ -6,10 +6,18 @@ import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { db, createId, watchTable } from '@/utils/db'
 import type { Section } from '@/types/section'
-import { createEmptySectionFilter, type SectionFilterState } from '@/types/section'
+import {
+  bankCoefInputToStore,
+  createEmptySectionFilter,
+  defaultBankCoef,
+  resolveSectionBankCoefs,
+  type BankCoefSource,
+  type SectionFilterState
+} from '@/types/section'
 import type { Vertical } from '@/types/vertical'
 import { buildRelativeDepths } from '@/types/vertical'
 import type { Point } from '@/types/point'
+import { calcMeanVelocity, calcSectionDischarge, type DischargeResult } from '@/utils/flow'
 
 /** 垂线录入草稿（新增/编辑表单共享结构） */
 export interface VerticalDraft {
@@ -105,6 +113,58 @@ export const useSectionStore = defineStore('section', () => {
       .sort((a, b) => a.startDistanceM - b.startDistanceM)
   }
 
+  /** 新建测次未填岸边系数时的默认落库结构：按测法标记默认来源，手填值留空 */
+  function defaultBankCoefFields(method: string | null | undefined): Pick<
+    Section,
+    'leftBankCoef' | 'rightBankCoef' | 'leftBankCoefSource' | 'rightBankCoefSource'
+  > {
+    const source: BankCoefSource = defaultBankCoef(method) !== null ? 'default' : 'none'
+    return { leftBankCoef: null, rightBankCoef: null, leftBankCoefSource: source, rightBankCoefSource: source }
+  }
+
+  /**
+   * 断面流量成果（统一入口）：按本测次左右岸系数对最左 / 最右垂线折算。
+   * 垂线页、测点页、级联重算共用，保证展示值与回写关系点据的值一致。
+   */
+  function sectionDischarge(section: Section | null | undefined): DischargeResult {
+    const rows = section
+      ? verticalsOfSection(section.id).map((vertical) => ({
+          id: vertical.id,
+          no: vertical.no,
+          startDistanceM: vertical.startDistanceM,
+          depthM: vertical.depthM,
+          meanVelocityMs: calcMeanVelocity(
+            pointsOfVertical(vertical.id).map((point) => ({ velocityMs: point.velocityMs, weight: point.weight }))
+          )
+        }))
+      : []
+    return calcSectionDischarge(rows, { bankCoefs: section ? resolveSectionBankCoefs(section) : null })
+  }
+
+  /** 直读 IndexedDB 计算断面流量（系数刚写入、liveQuery 缓存尚未刷新时用） */
+  async function sectionDischargeFromDb(sectionId: string): Promise<DischargeResult> {
+    const [section, verticalRows] = await Promise.all([
+      db.sections.get(sectionId),
+      db.verticals.where('sectionId').equals(sectionId).toArray()
+    ])
+    const pointRows =
+      verticalRows.length > 0 ? await db.points.where('verticalId').anyOf(verticalRows.map((row) => row.id)).toArray() : []
+    const rows = verticalRows
+      .sort((a, b) => a.startDistanceM - b.startDistanceM)
+      .map((vertical) => ({
+        id: vertical.id,
+        no: vertical.no,
+        startDistanceM: vertical.startDistanceM,
+        depthM: vertical.depthM,
+        meanVelocityMs: calcMeanVelocity(
+          pointRows
+            .filter((point) => point.verticalId === vertical.id)
+            .map((point) => ({ velocityMs: point.velocityMs, weight: point.weight }))
+        )
+      }))
+    return calcSectionDischarge(rows, { bankCoefs: section ? resolveSectionBankCoefs(section) : null })
+  }
+
   const currentVertical = computed<Vertical | null>(() =>
     currentVerticalId.value
       ? verticals.value.find((vertical) => vertical.id === currentVerticalId.value) ?? null
@@ -179,16 +239,81 @@ export const useSectionStore = defineStore('section', () => {
   /* ------------------------------ 断面测次 ------------------------------ */
 
   async function createSection(
-    payload: Omit<Section, 'id' | 'createdAt' | 'updatedAt'>
+    payload: Omit<Section, 'id' | 'createdAt' | 'updatedAt' | 'leftBankCoef' | 'rightBankCoef' | 'leftBankCoefSource' | 'rightBankCoefSource'> &
+      Partial<Pick<Section, 'leftBankCoef' | 'rightBankCoef' | 'leftBankCoefSource' | 'rightBankCoefSource'>>
   ): Promise<Section> {
     const now = Date.now()
-    const row: Section = { ...payload, id: createId('sec'), createdAt: now, updatedAt: now }
+    const defaults = defaultBankCoefFields(payload.method)
+    const row: Section = {
+      ...payload,
+      leftBankCoef: payload.leftBankCoef ?? defaults.leftBankCoef,
+      rightBankCoef: payload.rightBankCoef ?? defaults.rightBankCoef,
+      leftBankCoefSource: payload.leftBankCoefSource ?? defaults.leftBankCoefSource,
+      rightBankCoefSource: payload.rightBankCoefSource ?? defaults.rightBankCoefSource,
+      id: createId('sec'),
+      createdAt: now,
+      updatedAt: now
+    }
     await db.sections.put(row)
     return row
   }
 
   async function updateSection(id: string, patch: Partial<Section>): Promise<void> {
-    await db.sections.update(id, { ...patch, updatedAt: Date.now() } as never)
+    // 手填系数清空（显式回退到按测法取默认）时，同步把来源标记改回 default/none
+    const next: Partial<Section> = { ...patch }
+    if (Object.prototype.hasOwnProperty.call(patch, 'leftBankCoef') && patch.leftBankCoef == null) {
+      const current = sectionById(id)
+      next.leftBankCoefSource = defaultBankCoef(patch.method ?? current?.method) !== null ? 'default' : 'none'
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, 'rightBankCoef') && patch.rightBankCoef == null) {
+      const current = sectionById(id)
+      next.rightBankCoefSource = defaultBankCoef(patch.method ?? current?.method) !== null ? 'default' : 'none'
+    }
+    await db.sections.update(id, { ...next, updatedAt: Date.now() } as never)
+  }
+
+  /**
+   * 保存某测次左右岸岸边流速系数（手填值；空表示未填，按测法取默认）。
+   * 系数一动，本测次断面流量、由本测次生成的关系点据与已生成的比测记录一起重算：
+   * - 关系点据按「测站 + 测次号」回写实测流量（与水位—流量定线口径一致）；
+   * - 关系点据变化后由 ratingStore.rebuildCompares 重算曲线流量、偏差与判定。
+   * 返回重算的关系点据条数，供页面提示。
+   */
+  async function applyBankCoefs(
+    id: string,
+    inputs: { left: number | null; right: number | null }
+  ): Promise<{ section: Section | null; ratingCount: number }> {
+    const section = sectionById(id)
+    if (!section) return { section: null, ratingCount: 0 }
+    const left = bankCoefInputToStore(inputs.left, section.method)
+    const right = bankCoefInputToStore(inputs.right, section.method)
+    const now = Date.now()
+    await db.sections.update(id, {
+      leftBankCoef: left.value,
+      rightBankCoef: right.value,
+      leftBankCoefSource: left.source,
+      rightBankCoefSource: right.source,
+      updatedAt: now
+    } as never)
+
+    // 取最新测次记录（避免依赖尚未刷新的 liveQuery 缓存）
+    const fresh = await db.sections.get(id)
+    const discharge = await sectionDischargeFromDb(id)
+    const ratingIds = await db.ratings
+      .where('stationId')
+      .equals(section.stationId)
+      .filter((rating) => rating.measureNo === section.measureNo)
+      .primaryKeys()
+    if (ratingIds.length > 0) {
+      await db.ratings
+        .where('id')
+        .anyOf(ratingIds)
+        .modify((rating) => {
+          rating.flowM3s = discharge.flowM3s
+          rating.updatedAt = now
+        })
+    }
+    return { section: fresh ?? section, ratingCount: ratingIds.length }
   }
 
   async function removeSection(id: string): Promise<void> {
@@ -357,6 +482,9 @@ export const useSectionStore = defineStore('section', () => {
     sectionById,
     verticalsOfSection,
     pointsOfVertical,
+    defaultBankCoefFields,
+    sectionDischarge,
+    sectionDischargeFromDb,
     verticalStats,
     sectionVerticalCounts,
     findDistanceConflicts,
@@ -369,6 +497,7 @@ export const useSectionStore = defineStore('section', () => {
     createSection,
     updateSection,
     removeSection,
+    applyBankCoefs,
     createVertical,
     updateVertical,
     removeVertical,

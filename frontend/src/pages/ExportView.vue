@@ -33,6 +33,7 @@ import {
   validateBackup
 } from '@/utils/export'
 import { fitPowerCurve } from '@/types/rating'
+import { BANK_COEF_SOURCE_TEXT, resolveSectionBankCoefs, type Section } from '@/types/section'
 
 const ratingStore = useRatingStore()
 const stationStore = useStationStore()
@@ -48,6 +49,25 @@ const exporting = ref(false)
 
 const compareRows = computed(() => ratingStore.compareRows)
 const overLimitRows = computed(() => ratingStore.overLimitRows)
+
+/** 比测点据 → 对应测次的岸边系数文案（按测站 + 测次号匹配） */
+function bankCoefOfCompare(row: (typeof compareRows.value)[number]): { text: string; found: boolean } {
+  if (!row.rating) return { text: '点据已删除', found: false }
+  const matched = sectionStore.sections.filter(
+    (section: Section) => section.stationId === row.rating?.stationId && section.measureNo === row.rating?.measureNo
+  )
+  if (matched.length === 0) return { text: '无对应测次', found: false }
+  // 同一测次号可能有多测次，逐条列出系数与来源
+  const text = matched
+    .map((section) => {
+      const resolved = resolveSectionBankCoefs(section)
+      const side = (value: number, source: 'manual' | 'default' | 'none') =>
+        source === 'none' ? '不折算' : `${value.toFixed(2)}(${BANK_COEF_SOURCE_TEXT[source]})`
+      return `左 ${side(resolved.left.value, resolved.left.source)} / 右 ${side(resolved.right.value, resolved.right.source)}`
+    })
+    .join('；')
+  return { text, found: true }
+}
 
 /** 检测结论：按测站汇总测次、最新水位、定线参数与超限点据 */
 const conclusions = ref<
@@ -156,6 +176,7 @@ async function refreshAll(): Promise<void> {
 }
 
 onMounted(() => {
+  sectionStore.start()
   void refreshAll()
 })
 </script>
@@ -222,7 +243,8 @@ onMounted(() => {
             <span class="gb-mono" :class="{ 'page__danger': row.overLimitCount > 0 }">{{ row.overLimitCount }}</span>
           </template>
         </el-table-column>
-        <el-table-column prop="fitText" label="定线成果" min-width="320" show-overflow-tooltip />
+        <el-table-column prop="fitText" label="定线成果" min-width="300" show-overflow-tooltip />
+        <el-table-column prop="bankCoefText" label="岸边流速系数（手填/默认）" min-width="320" show-overflow-tooltip />
       </el-table>
     </el-card>
 
@@ -261,6 +283,11 @@ onMounted(() => {
         <el-table-column label="实测流量" width="130" align="right">
           <template #default="{ row }">
             <span class="gb-mono">{{ row.compare.measuredFlow.toFixed(1) }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="岸边系数" min-width="210">
+          <template #default="{ row }">
+            <span class="gb-hint">{{ bankCoefOfCompare(row).text }}</span>
           </template>
         </el-table-column>
         <el-table-column label="曲线流量" width="130" align="right">

@@ -11,6 +11,7 @@ import {
   stampBackupTime,
   type BackupPayload
 } from '@/utils/db'
+import { BANK_COEF_SOURCE_TEXT, resolveSectionBankCoefs } from '@/types/section'
 
 /** 备份集合键名 */
 export const BACKUP_KEYS = ['stations', 'sections', 'verticals', 'points', 'ratings', 'compares'] as const
@@ -182,6 +183,22 @@ export interface ConclusionLine {
   ratingCount: number
   overLimitCount: number
   fitText: string
+  /** 岸边流速系数采用情况（逐测次写明手填 / 默认 / 不折算） */
+  bankCoefText: string
+}
+
+/** 单测次岸边系数结论文案，如「2024-06-001：左 0.70(默认)/右 0.67(手填)」 */
+export function describeSectionBankCoefs(
+  section: BackupPayload['sections'][number]
+): string {
+  const resolved = resolveSectionBankCoefs(section)
+  const side = (value: number, source: 'manual' | 'default' | 'none'): string => {
+    if (source === 'none') return '不折算'
+    return `${value.toFixed(2)}(${BANK_COEF_SOURCE_TEXT[source]})`
+  }
+  const left = side(resolved.left.value, resolved.left.source)
+  const right = side(resolved.right.value, resolved.right.source)
+  return `${section.measureNo}：左 ${left} / 右 ${right}`
 }
 
 export function buildConclusionLines(
@@ -205,6 +222,14 @@ export function buildConclusionLines(
       if (!fit || !fit.valid) return `${lineNo} 线未定线`
       return `${lineNo} 线 Q=${fit.a}·(H-${fit.h0})^${fit.b}，残差 ${fit.meanResidualPct}%（${fit.sampleCount} 点）`
     })
+    const bankCoefText =
+      sections.length > 0
+        ? sections
+            .slice()
+            .sort((a, b) => Date.parse(b.measuredAt) - Date.parse(a.measuredAt))
+            .map(describeSectionBankCoefs)
+            .join('；')
+        : '暂无测次'
     return {
       stationId: station.id,
       stationName: station.name,
@@ -213,7 +238,8 @@ export function buildConclusionLines(
       latestStageM: latest,
       ratingCount: ratings.length,
       overLimitCount,
-      fitText: fitParts.length > 0 ? fitParts.join('；') : '暂无关系点据'
+      fitText: fitParts.length > 0 ? fitParts.join('；') : '暂无关系点据',
+      bankCoefText
     }
   })
 }
