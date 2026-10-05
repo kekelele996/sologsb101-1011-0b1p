@@ -17,7 +17,7 @@ import { fitPowerCurve } from '@/types/rating'
 import { calcMeanVelocity, DEFAULT_WEIGHTS, round } from '@/utils/flow'
 
 /** 当前数据结构版本号：每次调整字段结构必须 +1 并补迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** 数据库名（浏览器 IndexedDB 中的库名） */
 export const DB_NAME = 'gbhydrogaug'
@@ -64,7 +64,7 @@ class HydroGaugeDatabase extends Dexie {
     })
 
     // v2：补齐筛选与统计需要的索引（河名/集水面积、水位、测法、偏差判定）
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         stations: 'id, name, river, sectionCode, catchmentKm2, updatedAt',
         sections: 'id, stationId, measureNo, method, stageM, measuredAt, updatedAt',
@@ -94,6 +94,32 @@ class HydroGaugeDatabase extends Dexie {
               Object.assign(row, defaults())
             })
         }
+      })
+
+    // v3：断面测次增加左右岸岸边流速系数（手填值，null 表示按测法取默认）
+    this.version(DB_VERSION)
+      .stores({
+        stations: 'id, name, river, sectionCode, catchmentKm2, updatedAt',
+        sections: 'id, stationId, measureNo, method, stageM, measuredAt, updatedAt',
+        verticals: 'id, sectionId, no, startDistanceM, depthM, updatedAt',
+        points: 'id, verticalId, relativeDepth, velocityMs, updatedAt',
+        ratings: 'id, stationId, lineNo, stageM, flowM3s, measuredAt, updatedAt',
+        compares: 'id, ratingId, verdict, deviationPct, comparedAt, updatedAt'
+      })
+      .upgrade(async (tx) => {
+        // 迁移：老测次没有岸边系数字段，回填 null —— 计算时按测法取默认系数；
+        // 测法无法识别的测次不折算，由垂线页与检测结论标注出来
+        await tx
+          .table('sections')
+          .toCollection()
+          .modify((row: Record<string, unknown>) => {
+            if (typeof row.bankLeftCoef !== 'number' || !Number.isFinite(row.bankLeftCoef)) {
+              row.bankLeftCoef = null
+            }
+            if (typeof row.bankRightCoef !== 'number' || !Number.isFinite(row.bankRightCoef)) {
+              row.bankRightCoef = null
+            }
+          })
       })
   }
 }
@@ -155,6 +181,8 @@ export async function seedDemoData(): Promise<void> {
           startDistanceM: 12.5,
           stageM: 5.42,
           method: '流速仪',
+          bankLeftCoef: 0.68,
+          bankRightCoef: null,
           measuredAt: '2024-06-12T08:30:00.000Z'
         },
         {
@@ -164,6 +192,8 @@ export async function seedDemoData(): Promise<void> {
           startDistanceM: 12.5,
           stageM: 6.15,
           method: 'ADCP',
+          bankLeftCoef: null,
+          bankRightCoef: null,
           measuredAt: '2024-07-18T09:10:00.000Z'
         }
       ],
@@ -203,6 +233,8 @@ export async function seedDemoData(): Promise<void> {
           startDistanceM: 4.2,
           stageM: 3.18,
           method: '浮标',
+          bankLeftCoef: null,
+          bankRightCoef: null,
           measuredAt: '2024-05-22T07:50:00.000Z'
         },
         {
@@ -212,6 +244,8 @@ export async function seedDemoData(): Promise<void> {
           startDistanceM: 4.2,
           stageM: 4.36,
           method: '流速仪',
+          bankLeftCoef: null,
+          bankRightCoef: null,
           measuredAt: '2024-08-09T06:40:00.000Z'
         }
       ],
@@ -251,6 +285,8 @@ export async function seedDemoData(): Promise<void> {
           startDistanceM: 18.0,
           stageM: 5.36,
           method: 'ADCP',
+          bankLeftCoef: null,
+          bankRightCoef: null,
           measuredAt: '2024-06-20T10:05:00.000Z'
         }
       ],

@@ -14,7 +14,14 @@ import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import RouteMissingPanel from '@/components/common/RouteMissingPanel.vue'
 import { useStationStore } from '@/stores/stationStore'
 import { useSectionStore } from '@/stores/sectionStore'
-import { MEASURE_METHODS, type MeasureMethod, type Section } from '@/types/section'
+import {
+  MEASURE_METHODS,
+  defaultBankCoef,
+  formatBankCoefText,
+  resolveBankCoefficients,
+  type MeasureMethod,
+  type Section
+} from '@/types/section'
 import { initDatabase } from '@/utils/db'
 
 const route = useRoute()
@@ -27,14 +34,21 @@ const station = computed(() => stationStore.stationById(stationId.value))
 
 const dialogVisible = ref(false)
 const editingId = ref<string | null>(null)
+/** 正在编辑的测次原值，用于判断岸边系数 / 测法是否被改动 */
+const editingSection = ref<Section | null>(null)
 const submitting = ref(false)
 const form = reactive({
   measureNo: '',
   startDistanceM: 0,
   stageM: 0,
   method: '流速仪' as MeasureMethod,
+  bankLeftCoef: null as number | null,
+  bankRightCoef: null as number | null,
   measuredAt: new Date().toISOString().slice(0, 16)
 })
+
+/** 当前测法的岸边系数默认值（表单占位提示） */
+const methodDefaultCoef = computed(() => defaultBankCoef(form.method))
 
 const sectionRows = computed(() => {
   const list = sectionStore.sectionsOfStation(stationId.value)
@@ -75,24 +89,35 @@ const stats = computed(() => {
 
 function openCreate(): void {
   editingId.value = null
+  editingSection.value = null
   form.measureNo = `${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, '0')}-${String(
     stats.value.count + 1
   ).padStart(3, '0')}`
   form.startDistanceM = stats.value.latest?.startDistanceM ?? 0
   form.stageM = stats.value.latest?.stageM ?? 0
   form.method = '流速仪'
+  form.bankLeftCoef = null
+  form.bankRightCoef = null
   form.measuredAt = new Date().toISOString().slice(0, 16)
   dialogVisible.value = true
 }
 
 function openEdit(section: Section): void {
   editingId.value = section.id
+  editingSection.value = section
   form.measureNo = section.measureNo
   form.startDistanceM = section.startDistanceM
   form.stageM = section.stageM
   form.method = section.method
+  form.bankLeftCoef = section.bankLeftCoef ?? null
+  form.bankRightCoef = section.bankRightCoef ?? null
   form.measuredAt = section.measuredAt.slice(0, 16)
   dialogVisible.value = true
+}
+
+/** 校验岸边系数：留空（按测法取默认）或 0.1 ~ 1.5 之间的数字 */
+function validBankCoef(value: number | null): boolean {
+  return value === null || (Number.isFinite(value) && value >= 0.1 && value <= 1.5)
 }
 
 async function submitForm(): Promise<void> {
@@ -108,6 +133,10 @@ async function submitForm(): Promise<void> {
     ElMessage.warning('起点距应为非负数字（m）')
     return
   }
+  if (!validBankCoef(form.bankLeftCoef) || !validBankCoef(form.bankRightCoef)) {
+    ElMessage.warning('岸边系数应在 0.1 ~ 1.5 之间，或留空按测法取默认')
+    return
+  }
   if (!form.measuredAt) {
     ElMessage.warning('请选择测流时间')
     return
@@ -120,11 +149,36 @@ async function submitForm(): Promise<void> {
       startDistanceM: form.startDistanceM,
       stageM: form.stageM,
       method: form.method,
+      bankLeftCoef: form.bankLeftCoef,
+      bankRightCoef: form.bankRightCoef,
       measuredAt: new Date(form.measuredAt).toISOString()
     }
     if (editingId.value) {
+      // 岸边系数或测法有变动时，断面流量与已生成的比测记录一起重算
+      const original = editingSection.value
+      const coefTouched =
+        original !== null &&
+        (original.method !== form.method ||
+          (original.bankLeftCoef ?? null) !== form.bankLeftCoef ||
+          (original.bankRightCoef ?? null) !== form.bankRightCoef)
       await sectionStore.updateSection(editingId.value, payload)
-      ElMessage.success('测次已更新')
+      if (coefTouched) {
+        const result = await sectionStore.recalcSectionCascade(editingId.value)
+        if (result && result.flowM3s > 0) {
+          const sourceText = formatBankCoefText(result.resolution)
+          ElMessage.success({
+            message:
+              result.ratingCount > 0
+                ? `测次已更新：断面流量重算为 ${result.flowM3s.toFixed(2)} m³/s（岸边系数 ${sourceText}），联动更新点据 ${result.ratingCount} 个、重算比测记录 ${result.compareCount} 条`
+                : `测次已更新：断面流量重算为 ${result.flowM3s.toFixed(2)} m³/s（岸边系数 ${sourceText}），暂无关联点据需联动`,
+            duration: 6000
+          })
+        } else {
+          ElMessage.success('测次已更新：岸边系数已保存，待布设垂线后参与断面流量计算')
+        }
+      } else {
+        ElMessage.success('测次已更新')
+      }
     } else {
       const created = await sectionStore.createSection(payload)
       sectionStore.selectSection(created.id)
@@ -281,6 +335,14 @@ onMounted(() => {
             </el-tag>
           </template>
         </el-table-column>
+        <el-table-column label="岸边系数" min-width="190">
+          <template #default="{ row }">
+            <el-tag v-if="!resolveBankCoefficients(row).applied" type="danger" size="small" effect="plain">
+              未折算（测法未识别）
+            </el-tag>
+            <span v-else class="gb-mono">{{ formatBankCoefText(resolveBankCoefficients(row)) }}</span>
+          </template>
+        </el-table-column>
         <el-table-column label="水位 (m)" width="110" align="right">
           <template #default="{ row }">
             <span class="gb-mono">{{ row.stageM.toFixed(2) }}</span>
@@ -330,6 +392,42 @@ onMounted(() => {
           <el-radio-group v-model="form.method">
             <el-radio-button v-for="method in MEASURE_METHODS" :key="method" :value="method">{{ method }}</el-radio-button>
           </el-radio-group>
+        </el-form-item>
+        <el-form-item label="左岸系数">
+          <el-input-number
+            v-model="form.bankLeftCoef"
+            :min="0.1"
+            :max="1.5"
+            :step="0.05"
+            :precision="2"
+            :value-on-clear="null"
+            controls-position="right"
+            :placeholder="methodDefaultCoef === null ? '无默认' : `默认 ${methodDefaultCoef.toFixed(2)}`"
+          />
+          <el-button text type="primary" size="small" class="page__coef-reset" @click="form.bankLeftCoef = null">
+            恢复默认
+          </el-button>
+        </el-form-item>
+        <el-form-item label="右岸系数">
+          <el-input-number
+            v-model="form.bankRightCoef"
+            :min="0.1"
+            :max="1.5"
+            :step="0.05"
+            :precision="2"
+            :value-on-clear="null"
+            controls-position="right"
+            :placeholder="methodDefaultCoef === null ? '无默认' : `默认 ${methodDefaultCoef.toFixed(2)}`"
+          />
+          <el-button text type="primary" size="small" class="page__coef-reset" @click="form.bankRightCoef = null">
+            恢复默认
+          </el-button>
+        </el-form-item>
+        <el-form-item label=" ">
+          <p class="gb-hint">
+            岸边流速系数留空时按测法取默认（流速仪 0.70 / 浮标 0.75 / ADCP 0.60），手填优先；
+            只折算最左、最右两条垂线各自分担的面积，保存后该测次流量与已生成的比测记录一起重算。
+          </p>
         </el-form-item>
         <el-form-item label="水位" required>
           <el-input-number v-model="form.stageM" :min="-50" :max="200" :step="0.01" :precision="2" controls-position="right" />
@@ -386,5 +484,9 @@ onMounted(() => {
   margin-left: 8px;
   font-size: 12px;
   color: #8194a2;
+}
+
+.page__coef-reset {
+  margin-left: 8px;
 }
 </style>

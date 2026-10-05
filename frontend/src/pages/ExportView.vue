@@ -30,7 +30,8 @@ import {
   importBackup,
   readFileText,
   remapIds,
-  validateBackup
+  validateBackup,
+  type ConclusionLine
 } from '@/utils/export'
 import { fitPowerCurve } from '@/types/rating'
 
@@ -49,19 +50,8 @@ const exporting = ref(false)
 const compareRows = computed(() => ratingStore.compareRows)
 const overLimitRows = computed(() => ratingStore.overLimitRows)
 
-/** 检测结论：按测站汇总测次、最新水位、定线参数与超限点据 */
-const conclusions = ref<
-  Array<{
-    stationId: string
-    stationName: string
-    river: string
-    sectionCount: number
-    latestStageM: number | null
-    ratingCount: number
-    overLimitCount: number
-    fitText: string
-  }>
->([])
+/** 检测结论：按测站汇总测次、最新水位、定线参数、超限点据与岸边系数来源 */
+const conclusions = ref<ConclusionLine[]>([])
 
 async function refreshCounts(): Promise<void> {
   counts.value = await countAll()
@@ -223,6 +213,7 @@ onMounted(() => {
           </template>
         </el-table-column>
         <el-table-column prop="fitText" label="定线成果" min-width="320" show-overflow-tooltip />
+        <el-table-column prop="bankText" label="岸边系数折算" min-width="280" show-overflow-tooltip />
       </el-table>
     </el-card>
 

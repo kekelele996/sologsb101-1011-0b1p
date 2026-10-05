@@ -15,6 +15,7 @@ import { useStationStore } from '@/stores/stationStore'
 import { useSectionStore } from '@/stores/sectionStore'
 import { parsePointPaste } from '@/types/point'
 import type { Point } from '@/types/point'
+import { resolveBankCoefficients } from '@/types/section'
 import { calcMeanVelocity, calcSectionDischarge, velocityFromRevolutions } from '@/utils/flow'
 import { initDatabase } from '@/utils/db'
 
@@ -49,9 +50,10 @@ const meanVelocityMs = computed(() =>
   calcMeanVelocity(points.value.map((point) => ({ velocityMs: point.velocityMs, weight: point.weight })))
 )
 
-/** 该垂线所在断面的流量成果（用于对比本垂线贡献） */
+/** 该垂线所在断面的流量成果（用于对比本垂线贡献，含岸边系数折算） */
 const discharge = computed(() => {
   if (!section.value) return null
+  const bank = resolveBankCoefficients(section.value)
   const rows = sectionStore.verticalsOfSection(section.value.id).map((item) => {
     const itemPoints = sectionStore.pointsOfVertical(item.id)
     return {
@@ -62,7 +64,7 @@ const discharge = computed(() => {
       meanVelocityMs: calcMeanVelocity(itemPoints.map((point) => ({ velocityMs: point.velocityMs, weight: point.weight })))
     }
   })
-  return calcSectionDischarge(rows)
+  return calcSectionDischarge(rows, { left: bank.left.coef, right: bank.right.coef })
 })
 
 /** 本垂线的部分流量 */

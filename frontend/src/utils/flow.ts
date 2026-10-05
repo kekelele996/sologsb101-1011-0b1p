@@ -45,10 +45,33 @@ export interface VerticalSlice {
   meanVelocityMs: number
 }
 
+/** 岸边流速系数对（左岸 / 右岸）；缺省为 1，即不折算 */
+export interface BankCoefPair {
+  left: number
+  right: number
+}
+
+const NO_BANK_REDUCTION: BankCoefPair = { left: 1, right: 1 }
+
+/** 逐垂线的部分面积法成果（含岸边折算前后对照） */
+export interface DischargeSlice {
+  id: string
+  no: number
+  partialAreaM2: number
+  /** 折算前部分流量（m³/s） */
+  partialFlowRaw: number
+  /** 该垂线分担面积使用的岸边流速系数；中间垂线为 null（不折算） */
+  bankCoef: number | null
+  /** 折算后部分流量（m³/s），参与断面流量汇总 */
+  partialFlow: number
+}
+
 /** 部分面积法计算成果 */
 export interface DischargeResult {
-  /** 断面流量（m³/s） */
+  /** 断面流量（m³/s）：岸边折算后 */
   flowM3s: number
+  /** 折算前断面流量（m³/s） */
+  flowRawM3s: number
   /** 断面面积（m²） */
   areaM2: number
   /** 断面平均流速（m/s） */
@@ -57,21 +80,34 @@ export interface DischargeResult {
   maxDepthM: number
   /** 水面宽（m） */
   widthM: number
-  /** 逐垂线的部分面积与部分流量 */
-  slices: Array<{ id: string; no: number; partialAreaM2: number; partialFlow: number }>
+  /** 逐垂线的部分面积与折算前后部分流量 */
+  slices: DischargeSlice[]
+}
+
+/**
+ * 岸边系数只压在最左、最右两条垂线各自分担的面积上，中间垂线照原样；
+ * 仅一条垂线时其两侧均靠边，取左右岸系数的均值折算。
+ */
+function bankCoefOf(index: number, count: number, bank: BankCoefPair): number | null {
+  if (count === 1) return round((bank.left + bank.right) / 2, 3)
+  if (index === 0) return bank.left
+  if (index === count - 1) return bank.right
+  return null
 }
 
 /**
  * 部分面积法（mid-section）计算断面流量：
- * 以每条垂线为中心，左右各取半间距合成部分宽度，部分流量 = 部分宽度 × 水深 × 垂线平均流速。
+ * 以每条垂线为中心，左右各取半间距合成部分宽度，部分流量 = 部分宽度 × 水深 × 垂线平均流速；
+ * 最左 / 最右两条垂线的部分流量再乘各自一侧的岸边流速系数。
  */
-export function calcSectionDischarge(input: VerticalSlice[]): DischargeResult {
+export function calcSectionDischarge(input: VerticalSlice[], bank: BankCoefPair = NO_BANK_REDUCTION): DischargeResult {
   const verticals = [...input]
     .filter((vertical) => Number.isFinite(vertical.startDistanceM) && Number.isFinite(vertical.depthM))
     .sort((a, b) => a.startDistanceM - b.startDistanceM)
 
   const empty: DischargeResult = {
     flowM3s: 0,
+    flowRawM3s: 0,
     areaM2: 0,
     meanVelocityMs: 0,
     maxDepthM: 0,
@@ -82,14 +118,17 @@ export function calcSectionDischarge(input: VerticalSlice[]): DischargeResult {
   if (verticals.length === 1) {
     const only = verticals[0]
     const partialAreaM2 = round(only.depthM * 1, 3)
-    const partialFlow = round(partialAreaM2 * only.meanVelocityMs, 3)
+    const partialFlowRaw = round(partialAreaM2 * only.meanVelocityMs, 3)
+    const coef = bankCoefOf(0, 1, bank)
+    const partialFlow = coef === null ? partialFlowRaw : round(partialFlowRaw * coef, 3)
     return {
       flowM3s: partialFlow,
+      flowRawM3s: partialFlowRaw,
       areaM2: partialAreaM2,
-      meanVelocityMs: round(only.meanVelocityMs, 3),
+      meanVelocityMs: partialAreaM2 > 0 ? round(partialFlow / partialAreaM2, 3) : 0,
       maxDepthM: round(only.depthM, 2),
       widthM: 0,
-      slices: [{ id: only.id, no: only.no, partialAreaM2, partialFlow }]
+      slices: [{ id: only.id, no: only.no, partialAreaM2, partialFlowRaw, bankCoef: coef, partialFlow }]
     }
   }
 
@@ -98,15 +137,21 @@ export function calcSectionDischarge(input: VerticalSlice[]): DischargeResult {
     const next = verticals[index + 1]
     const leftSpan = previous ? (vertical.startDistanceM - previous.startDistanceM) / 2 : 0
     const rightSpan = next ? (next.startDistanceM - vertical.startDistanceM) / 2 : 0
-    const span = index === 0 || index === verticals.length - 1 ? leftSpan + rightSpan : leftSpan + rightSpan
+    const span = leftSpan + rightSpan
     const partialAreaM2 = round(vertical.depthM * span, 3)
-    const partialFlow = round(partialAreaM2 * vertical.meanVelocityMs, 3)
-    return { id: vertical.id, no: vertical.no, partialAreaM2, partialFlow }
+    const partialFlowRaw = round(partialAreaM2 * vertical.meanVelocityMs, 3)
+    const coef = bankCoefOf(index, verticals.length, bank)
+    const partialFlow = coef === null ? partialFlowRaw : round(partialFlowRaw * coef, 3)
+    return { id: vertical.id, no: vertical.no, partialAreaM2, partialFlowRaw, bankCoef: coef, partialFlow }
   })
 
   const areaM2 = round(
     slices.reduce((sum, slice) => sum + slice.partialAreaM2, 0),
     2
+  )
+  const flowRawM3s = round(
+    slices.reduce((sum, slice) => sum + slice.partialFlowRaw, 0),
+    3
   )
   const flowM3s = round(
     slices.reduce((sum, slice) => sum + slice.partialFlow, 0),
@@ -122,6 +167,7 @@ export function calcSectionDischarge(input: VerticalSlice[]): DischargeResult {
   )
   return {
     flowM3s,
+    flowRawM3s,
     areaM2,
     meanVelocityMs: areaM2 > 0 ? round(flowM3s / areaM2, 3) : 0,
     maxDepthM,

@@ -189,23 +189,23 @@ export const useRatingStore = defineStore('rating', () => {
   /**
    * 由点据生成 / 刷新比测记录：曲线流量取当前定线拟合值，
    * 偏差超过限值自动判定超限并进入分析清单。
+   * 直接读库而非 store 缓存，保证岸边系数联动改写点据后能立刻重算。
    */
   async function rebuildCompares(lineNo?: string): Promise<number> {
     const targetLine = lineNo ?? activeLineNo.value
+    const [allRatings, existingCompares] = await Promise.all([db.ratings.toArray(), db.compares.toArray()])
+    const targets = allRatings.filter((rating) => rating.lineNo === targetLine)
     const fit = fitPowerCurve(
-      ratings.value
-        .filter((rating) => rating.lineNo === targetLine)
-        .map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s })),
+      targets.map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s })),
       targetLine
     )
     setFit(fit)
-    const targets = ratings.value.filter((rating) => rating.lineNo === targetLine)
     if (targets.length === 0) return 0
     const now = Date.now()
     const rows: Compare[] = targets.map((rating) => {
       const predicted = fit.valid ? curveFlow(fit, rating.stageM) : rating.flowM3s
       const deviationPct = calcDeviationPct(rating.flowM3s, predicted)
-      const existing = compares.value.find((item) => item.ratingId === rating.id)
+      const existing = existingCompares.find((item) => item.ratingId === rating.id)
       return {
         id: existing?.id ?? createId('cmp'),
         ratingId: rating.id,

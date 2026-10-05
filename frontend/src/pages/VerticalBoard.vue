@@ -14,6 +14,7 @@ import RouteMissingPanel from '@/components/common/RouteMissingPanel.vue'
 import { useStationStore } from '@/stores/stationStore'
 import { useSectionStore } from '@/stores/sectionStore'
 import { buildRelativeDepths, type Vertical } from '@/types/vertical'
+import { formatBankCoefText, resolveBankCoefficients } from '@/types/section'
 import { calcMeanVelocity, calcSectionDischarge } from '@/utils/flow'
 import { initDatabase } from '@/utils/db'
 
@@ -49,7 +50,10 @@ const verticalRows = computed(() =>
   })
 )
 
-/** 断面流量成果：部分面积法 */
+/** 该测次的岸边流速系数结论（手填优先，未填按测法取默认） */
+const bankResolution = computed(() => (section.value ? resolveBankCoefficients(section.value) : null))
+
+/** 断面流量成果：部分面积法，最左 / 最右垂线分担面积乘岸边流速系数 */
 const discharge = computed(() =>
   calcSectionDischarge(
     verticalRows.value.map((row) => ({
@@ -58,7 +62,10 @@ const discharge = computed(() =>
       startDistanceM: row.vertical.startDistanceM,
       depthM: row.vertical.depthM,
       meanVelocityMs: row.meanVelocityMs
-    }))
+    })),
+    bankResolution.value
+      ? { left: bankResolution.value.left.coef, right: bankResolution.value.right.coef }
+      : undefined
   )
 )
 
@@ -234,6 +241,14 @@ onMounted(() => {
         :title="`起点距排序校验未通过：垂线 ${conflicts.join('、')} 的起点距与其他垂线重复，请调整后再参与流量计算`"
       />
 
+      <el-alert
+        v-if="bankResolution && !bankResolution.applied"
+        type="warning"
+        show-icon
+        :closable="false"
+        title="该测次测法无法识别，岸边面积未折算：请在测次编辑中手填左右岸系数，或修正测法后按默认系数折算"
+      />
+
       <EmptyPanel
         v-if="verticalRows.length === 0"
         title="该测次还没有垂线"
@@ -292,6 +307,15 @@ onMounted(() => {
           <h3>部分面积法断面流量成果</h3>
           <span class="gb-hint">水面宽 {{ discharge.widthM }} m · 断面面积 {{ discharge.areaM2 }} m² · 平均流速 {{ discharge.meanVelocityMs }} m/s</span>
         </div>
+        <p v-if="bankResolution" class="gb-hint page__bank-line">
+          岸边流速系数：{{ formatBankCoefText(bankResolution) }}
+          <template v-if="bankResolution.applied">
+            ；折算前 {{ discharge.flowRawM3s.toFixed(2) }} m³/s → 折算后 {{ discharge.flowM3s.toFixed(2) }} m³/s
+          </template>
+          <template v-if="verticalRows.length === 1 && bankResolution.applied">
+            （仅一条垂线，两侧均靠边，取左右岸系数均值折算）
+          </template>
+        </p>
         <el-table :data="discharge.slices" border size="small" class="gb-table-compact">
           <el-table-column prop="no" label="垂线号" width="90" align="center" />
           <el-table-column label="部分面积 (m²)" align="right">
@@ -299,9 +323,22 @@ onMounted(() => {
               <span class="gb-mono">{{ row.partialAreaM2.toFixed(3) }}</span>
             </template>
           </el-table-column>
-          <el-table-column label="部分流量 (m³/s)" align="right">
+          <el-table-column label="岸边系数" width="100" align="center">
             <template #default="{ row }">
-              <span class="gb-mono">{{ row.partialFlow.toFixed(3) }}</span>
+              <span v-if="row.bankCoef === null" class="gb-hint">—</span>
+              <span v-else class="gb-mono">{{ row.bankCoef.toFixed(2) }}</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="折算前部分流量 (m³/s)" align="right">
+            <template #default="{ row }">
+              <span class="gb-mono">{{ row.partialFlowRaw.toFixed(3) }}</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="折算后部分流量 (m³/s)" align="right">
+            <template #default="{ row }">
+              <span class="gb-mono" :class="{ page__reduced: row.bankCoef !== null && row.bankCoef !== 1 }">
+                {{ row.partialFlow.toFixed(3) }}
+              </span>
             </template>
           </el-table-column>
           <el-table-column label="占断面流量" align="right">
@@ -385,5 +422,14 @@ onMounted(() => {
   margin-left: 4px;
   color: #d68910;
   vertical-align: middle;
+}
+
+.page__bank-line {
+  margin: 0 0 8px;
+}
+
+.page__reduced {
+  color: #0f4c75;
+  font-weight: 700;
 }
 </style>

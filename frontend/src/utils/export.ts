@@ -11,6 +11,7 @@ import {
   stampBackupTime,
   type BackupPayload
 } from '@/utils/db'
+import { formatBankCoefText, resolveBankCoefficients } from '@/types/section'
 
 /** 备份集合键名 */
 export const BACKUP_KEYS = ['stations', 'sections', 'verticals', 'points', 'ratings', 'compares'] as const
@@ -182,6 +183,8 @@ export interface ConclusionLine {
   ratingCount: number
   overLimitCount: number
   fitText: string
+  /** 各测次岸边流速系数结论（手填 / 默认 / 未折算） */
+  bankText: string
 }
 
 export function buildConclusionLines(
@@ -205,6 +208,9 @@ export function buildConclusionLines(
       if (!fit || !fit.valid) return `${lineNo} 线未定线`
       return `${lineNo} 线 Q=${fit.a}·(H-${fit.h0})^${fit.b}，残差 ${fit.meanResidualPct}%（${fit.sampleCount} 点）`
     })
+    const bankParts = sections.map(
+      (section) => `${section.measureNo} ${formatBankCoefText(resolveBankCoefficients(section))}`
+    )
     return {
       stationId: station.id,
       stationName: station.name,
@@ -213,7 +219,8 @@ export function buildConclusionLines(
       latestStageM: latest,
       ratingCount: ratings.length,
       overLimitCount,
-      fitText: fitParts.length > 0 ? fitParts.join('；') : '暂无关系点据'
+      fitText: fitParts.length > 0 ? fitParts.join('；') : '暂无关系点据',
+      bankText: bankParts.length > 0 ? bankParts.join('；') : '暂无测次'
     }
   })
 }

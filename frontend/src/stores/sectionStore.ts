@@ -6,10 +6,17 @@ import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { db, createId, watchTable } from '@/utils/db'
 import type { Section } from '@/types/section'
-import { createEmptySectionFilter, type SectionFilterState } from '@/types/section'
+import {
+  createEmptySectionFilter,
+  resolveBankCoefficients,
+  type BankCoefResolution,
+  type SectionFilterState
+} from '@/types/section'
 import type { Vertical } from '@/types/vertical'
 import { buildRelativeDepths } from '@/types/vertical'
 import type { Point } from '@/types/point'
+import { calcMeanVelocity, calcSectionDischarge } from '@/utils/flow'
+import { useRatingStore } from '@/stores/ratingStore'
 
 /** 垂线录入草稿（新增/编辑表单共享结构） */
 export interface VerticalDraft {
@@ -35,6 +42,22 @@ export function createEmptyVerticalDraft(nextNo = 1): VerticalDraft {
 
 export function createEmptyPointDraft(): PointDraft {
   return { relativeDepth: 0.6, velocityMs: 0.5, weight: 1, durationS: 100 }
+}
+
+/** 岸边系数联动重算的结果摘要 */
+export interface SectionCascadeResult {
+  /** 折算后断面流量（m³/s） */
+  flowM3s: number
+  /** 折算前断面流量（m³/s） */
+  flowRawM3s: number
+  /** 实际使用的左右岸系数及来源 */
+  resolution: BankCoefResolution
+  /** 联动更新实测流量的点据数 */
+  ratingCount: number
+  /** 联动重算的比测记录数 */
+  compareCount: number
+  /** 参与重算的定线号 */
+  lineNos: string[]
 }
 
 export const useSectionStore = defineStore('section', () => {
@@ -200,6 +223,64 @@ export const useSectionStore = defineStore('section', () => {
       }
       await db.sections.delete(id)
     })
+  }
+
+  /**
+   * 岸边系数变动后的联动重算：
+   * 重算该测次断面流量 → 回写同测站同测次号点据的实测流量 → 重算对应定线的比测记录。
+   * 测次还没有垂线成果（流量为 0）时只返回系数结论，不回写点据。
+   */
+  async function recalcSectionCascade(sectionId: string): Promise<SectionCascadeResult | null> {
+    const section = await db.sections.get(sectionId)
+    if (!section) return null
+    const resolution = resolveBankCoefficients(section)
+    const verticalRows = await db.verticals.where('sectionId').equals(sectionId).toArray()
+    const slices = await Promise.all(
+      verticalRows.map(async (vertical) => {
+        const pointRows = await db.points.where('verticalId').equals(vertical.id).toArray()
+        return {
+          id: vertical.id,
+          no: vertical.no,
+          startDistanceM: vertical.startDistanceM,
+          depthM: vertical.depthM,
+          meanVelocityMs: calcMeanVelocity(
+            pointRows.map((point) => ({ velocityMs: point.velocityMs, weight: point.weight }))
+          )
+        }
+      })
+    )
+    const discharge = calcSectionDischarge(slices, {
+      left: resolution.left.coef,
+      right: resolution.right.coef
+    })
+
+    let ratingCount = 0
+    let compareCount = 0
+    const lineNos: string[] = []
+    if (discharge.flowM3s > 0) {
+      const stationRatings = await db.ratings.where('stationId').equals(section.stationId).toArray()
+      const linked = stationRatings.filter((rating) => rating.measureNo === section.measureNo)
+      if (linked.length > 0) {
+        const now = Date.now()
+        await db.ratings.bulkPut(
+          linked.map((rating) => ({ ...rating, flowM3s: discharge.flowM3s, updatedAt: now }))
+        )
+        ratingCount = linked.length
+        const ratingStore = useRatingStore()
+        for (const lineNo of Array.from(new Set(linked.map((rating) => rating.lineNo)))) {
+          compareCount += await ratingStore.rebuildCompares(lineNo)
+          lineNos.push(lineNo)
+        }
+      }
+    }
+    return {
+      flowM3s: discharge.flowM3s,
+      flowRawM3s: discharge.flowRawM3s,
+      resolution,
+      ratingCount,
+      compareCount,
+      lineNos
+    }
   }
 
   /* ------------------------------- 垂线 ------------------------------- */
@@ -369,6 +450,7 @@ export const useSectionStore = defineStore('section', () => {
     createSection,
     updateSection,
     removeSection,
+    recalcSectionCascade,
     createVertical,
     updateVertical,
     removeVertical,
